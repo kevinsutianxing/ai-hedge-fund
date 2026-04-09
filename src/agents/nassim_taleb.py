@@ -73,7 +73,7 @@ def nassim_taleb_agent(state: AgentState, agent_id: str = "nassim_taleb_agent"):
         )
 
         progress.update_status(agent_id, ticker, "Fetching insider trades")
-        insider_trades = get_insider_trades(ticker, end_date=end_date, start_date=start_date)
+        insider_trades = get_insider_trades(ticker)
 
         progress.update_status(agent_id, ticker, "Fetching company news")
         news = get_company_news(ticker, end_date=end_date, start_date=start_date, limit=100)

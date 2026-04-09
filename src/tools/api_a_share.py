@@ -657,7 +657,7 @@ def search_line_items(
 # ---------------------------------------------------------------------------
 
 
-def get_company_news(ticker: str, end_date: str, limit: int = 100, api_key: str = None) -> list[CompanyNews]:
+def get_company_news(ticker: str, *args, end_date: str = None, limit: int = 100, api_key: str = None, **kwargs) -> list[CompanyNews]:
     code = _stock_code(ticker)
     try:
         import akshare as ak
@@ -686,7 +686,7 @@ def get_company_news(ticker: str, end_date: str, limit: int = 100, api_key: str 
 # ---------------------------------------------------------------------------
 
 
-def get_insider_trades(ticker: str, api_key: str = None) -> list[InsiderTrade]:
+def get_insider_trades(ticker: str, *args, api_key: str = None, **kwargs) -> list[InsiderTrade]:
     return []
 
 
