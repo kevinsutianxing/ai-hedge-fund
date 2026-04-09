@@ -1,4 +1,5 @@
 import json
+import os
 import time
 from langchain_core.messages import HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
@@ -8,6 +9,8 @@ from pydantic import BaseModel, Field
 from typing_extensions import Literal
 from src.utils.progress import progress
 from src.utils.llm import call_llm
+
+_IS_A_SHARE = os.environ.get("DATA_PROVIDER", "us").lower() == "a_share"
 
 
 class PortfolioDecision(BaseModel):
@@ -129,19 +132,19 @@ def compute_allowed_actions(
             if max_buy > 0:
                 actions["buy"] = max_buy
 
-        # Short side
-        if short_shares > 0:
-            actions["cover"] = short_shares
-        if price > 0 and max_qty > 0:
-            if margin_requirement <= 0.0:
-                # If margin requirement is zero or unset, only cap by max_qty
-                max_short = max_qty
-            else:
-                available_margin = max(0.0, (equity / margin_requirement) - margin_used)
-                max_short_margin = int(available_margin // price)
-                max_short = max(0, min(max_qty, max_short_margin))
-            if max_short > 0:
-                actions["short"] = max_short
+        # Short side (disabled for A-shares)
+        if not _IS_A_SHARE:
+            if short_shares > 0:
+                actions["cover"] = short_shares
+            if price > 0 and max_qty > 0:
+                if margin_requirement <= 0.0:
+                    max_short = max_qty
+                else:
+                    available_margin = max(0.0, (equity / margin_requirement) - margin_used)
+                    max_short_margin = int(available_margin // price)
+                    max_short = max(0, min(max_qty, max_short_margin))
+                if max_short > 0:
+                    actions["short"] = max_short
 
         # Hold always valid
         actions["hold"] = 0
