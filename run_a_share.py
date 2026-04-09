@@ -7,10 +7,10 @@ os.environ["OPENAI_API_KEY"] = os.environ.get("ZAI_API_KEY", "")
 os.environ["OPENAI_API_BASE"] = "https://open.bigmodel.cn/api/coding/paas/v4"
 
 # Add project to path
-sys.path.insert(0, "/tmp/ai-hedge-fund")
+sys.path.insert(0, "/home/ubuntu/.openclaw/workspace-kevinCoderHK/ai-hedge-fund-ashare")
 
 from dotenv import load_dotenv
-load_dotenv("/tmp/ai-hedge-fund/.env")
+load_dotenv("/home/ubuntu/.openclaw/workspace-kevinCoderHK/ai-hedge-fund-ashare/.env")
 
 from src.main import run_hedge_fund, create_workflow
 

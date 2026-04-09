@@ -9,6 +9,9 @@ Usage:
 
 import logging
 import os
+import re
+import subprocess
+import json
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -64,6 +67,165 @@ def _stock_code(ticker: str) -> str:
 def _report_end_date(end_date: str) -> str:
     """Convert YYYY-MM-DD to YYYYMMDD."""
     return end_date.replace("-", "")
+
+
+# ---------------------------------------------------------------------------
+# AkShare proxy setup
+# ---------------------------------------------------------------------------
+# akshare 经常限流断连，强制走代理池 (QG_PROXY_AUTHKEY / QG_PROXY_AUTHPWD)
+# 代理通过 HTTP_PROXY / HTTPS_PROXY 环境变量注入，akshare 使用 requests，会自动读取
+
+def _setup_akshare_proxy():
+    """Fetch a fresh proxy from QG pool and inject into env for akshare requests.
+    Call once per process start. No-op if credentials are missing."""
+    authkey = os.environ.get("QG_PROXY_AUTHKEY")
+    authpwd = os.environ.get("QG_PROXY_AUTHPWD")
+    if not authkey or not authpwd:
+        logger.debug("QG proxy credentials not set, akshare will run without proxy")
+        return
+    # 已经设置过就不重复拉
+    if os.environ.get("_AKSHARE_PROXY_SET"):
+        return
+    try:
+        import subprocess, json
+        result = subprocess.run(
+            ["python3", os.path.expanduser("~/.openclaw/skills/proxy-pool-qg/scripts/qg_proxy.py"), "fetch", "--num", "1"],
+            capture_output=True, text=True, timeout=10
+        )
+        proxies = json.loads(result.stdout)
+        if proxies and proxies[0].get("proxy_url"):
+            proxy_url = proxies[0]["proxy_url"]
+            # 只设 HTTP_PROXY，不设 HTTPS_PROXY
+            # QG 代理池是 HTTP 代理，不支持 HTTPS CONNECT 隧道
+            # 设 HTTPS_PROXY 会破坏 iFind MCP / tushare 的 HTTPS 连接
+            os.environ["HTTP_PROXY"] = proxy_url
+            os.environ["_AKSHARE_PROXY_SET"] = "1"
+            logger.info(f"akshare proxy set (HTTP only): {proxies[0].get('proxy_ip', proxy_url)}")
+        else:
+            logger.warning("QG proxy pool returned no proxies")
+    except Exception as e:
+        logger.warning(f"Failed to fetch QG proxy: {e}")
+
+
+# 模块加载时立即设置代理
+_setup_akshare_proxy()
+
+
+# ---------------------------------------------------------------------------
+# iFind MCP helper
+# ---------------------------------------------------------------------------
+
+_IFIND_SCRIPT = os.path.expanduser("~/.openclaw/skills/ifind-mcp/scripts/ifind_mcp.py")
+
+# Simple ticker→name cache for iFind queries
+_ticker_name_cache: dict[str, str] = {}
+
+
+def _get_stock_name(ticker: str, ts_api=None) -> str:
+    """Get stock name from cache, tushare, or a hardcoded map."""
+    if ticker in _ticker_name_cache:
+        return _ticker_name_cache[ticker]
+    # Try tushare
+    if ts_api:
+        try:
+            df = ts_api.stock_basic(ts_code=ticker, fields="name")
+            if df is not None and not df.empty:
+                name = df.iloc[0]["name"]
+                _ticker_name_cache[ticker] = name
+                return name
+        except Exception:
+            pass
+    # Try akshare as fallback for name
+    try:
+        import akshare as ak
+        code = _stock_code(ticker)
+        df = ak.stock_individual_info_em(symbol=code)
+        if df is not None and not df.empty:
+            for _, row in df.iterrows():
+                if row.get("item") == "股票简称":
+                    name = str(row.get("value", ""))
+                    if name:
+                        _ticker_name_cache[ticker] = name
+                        return name
+    except Exception:
+        pass
+    return ticker
+
+
+def _ifind_call(tool: str, query: str) -> dict:
+    """Call iFind MCP and return parsed JSON result."""
+    try:
+        result = subprocess.run(
+            ["python3", _IFIND_SCRIPT, "call", "stock", tool, query],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            return json.loads(result.stdout)
+    except Exception as e:
+        logger.debug(f"iFind call failed: {e}")
+    return {}
+
+
+def _ifind_table_to_dict(answer: str) -> dict:
+    """Parse iFind markdown table answer into {column_name: value} dict."""
+    lines = answer.strip().split("\n")
+    if len(lines) < 3:
+        return {}
+    # header line and separator
+    headers = [h.strip() for h in lines[0].split("|")[1:-1]]
+    # data line (first row after header + separator)
+    data_line = lines[2] if len(lines) > 2 else ""
+    values = [v.strip() for v in data_line.split("|")[1:-1]]
+    return dict(zip(headers, values))
+
+
+def _parse_pct(text: str, keyword: str) -> float | None:
+    """Extract percentage value like '15.712' from text containing keyword."""
+    pattern = rf"{re.escape(keyword)}[：:]*\s*([\-\d.]+)"
+    m = re.search(pattern, text)
+    if m:
+        try:
+            return float(m.group(1)) / 100
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+def _parse_cell_amount(cell: str) -> float | None:
+    """Parse a cell value that may contain 亿/万 suffix, e.g. '2.1838亿' or '7797.4438万'."""
+    if not cell:
+        return None
+    m = re.match(r'([\-\d.]+)\s*(亿|万)?', cell.strip())
+    if m:
+        try:
+            val = float(m.group(1))
+            unit = m.group(2)
+            if unit == '亿':
+                val *= 1e8
+            elif unit == '万':
+                val *= 1e4
+            return val
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+def _parse_amount(text: str, keyword: str) -> float | None:
+    """Extract amount value (handling 亿/万 suffix) from text."""
+    pattern = rf"{re.escape(keyword)}[：:\s]*([\-\d.]+)\s*(亿|万)?"
+    m = re.search(pattern, text)
+    if m:
+        try:
+            val = float(m.group(1))
+            unit = m.group(2)
+            if unit == "亿":
+                val *= 1e8
+            elif unit == "万":
+                val *= 1e4
+            return val
+        except (ValueError, TypeError):
+            pass
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +606,59 @@ def get_financial_metrics(
         except Exception as e:
             logger.error(f"akshare financial_metrics fallback failed for {ticker}: {e}")
 
+    # iFind fallback: patch missing growth/debt fields, or create entry if list is empty
+    try:
+        stock_name = _get_stock_name(ticker, ts_api)
+        query = f"{stock_name}最近一期营收同比增速、净利润同比增速、资产负债率"
+        resp = _ifind_call("get_stock_financials", query)
+        answer = resp.get("data", {}).get("answer", "")
+        if answer and answer.strip():
+            row_dict = _ifind_table_to_dict(answer)
+            # Case 1: metrics_list has entries — patch missing fields
+            for m in metrics_list:
+                if m.revenue_growth is None:
+                    key = "营业收入(同比增长率)（单位：%）"
+                    if key in row_dict and row_dict[key]:
+                        try: m.revenue_growth = float(row_dict[key]) / 100
+                        except (ValueError, TypeError): pass
+                if m.earnings_growth is None:
+                    key = "归属母公司股东的净利润(同比增长率)（单位：%）"
+                    if key in row_dict and row_dict[key]:
+                        try: m.earnings_growth = float(row_dict[key]) / 100
+                        except (ValueError, TypeError): pass
+                if m.debt_to_equity is None:
+                    key = "资产负债率（单位：%）"
+                    if key in row_dict and row_dict[key]:
+                        try: m.debt_to_equity = float(row_dict[key]) / 100
+                        except (ValueError, TypeError): pass
+            # Case 2: metrics_list is empty — create a minimal entry from iFind
+            if not metrics_list:
+                rg = eg = de = None
+                key = "营业收入(同比增长率)（单位：%）"
+                if key in row_dict and row_dict[key]:
+                    try: rg = float(row_dict[key]) / 100
+                    except (ValueError, TypeError): pass
+                key = "归属母公司股东的净利润(同比增长率)（单位：%）"
+                if key in row_dict and row_dict[key]:
+                    try: eg = float(row_dict[key]) / 100
+                    except (ValueError, TypeError): pass
+                key = "资产负债率（单位：%）"
+                if key in row_dict and row_dict[key]:
+                    try: de = float(row_dict[key]) / 100
+                    except (ValueError, TypeError): pass
+                if rg is not None or eg is not None or de is not None:
+                    metrics_list.append(FinancialMetrics(
+                        ticker=ticker,
+                        report_period=end_dt,
+                        period="quarterly",
+                        currency="CNY",
+                        revenue_growth=rg,
+                        earnings_growth=eg,
+                        debt_to_equity=de,
+                    ))
+    except Exception as e:
+        logger.debug(f"iFind fallback for financial_metrics failed: {e}")
+
     return metrics_list
 
 
@@ -523,6 +738,8 @@ def search_line_items(
     ts_code = _ts_code(ticker)
     end_dt = _report_end_date(end_date)
     start_dt = (datetime.strptime(end_dt, "%Y%m%d") - timedelta(days=limit * 120)).strftime("%Y%m%d")
+
+    result = []
 
     try:
         df_income = ts_api.income(
@@ -649,7 +866,39 @@ def search_line_items(
         return result
     except Exception as e:
         logger.error(f"search_line_items failed for {ticker}: {e}")
-        return []
+
+    # iFind fallback: patch missing R&D / FCF fields
+    if not result:
+        try:
+            stock_name = _get_stock_name(ticker, ts_api)
+            need_rd = "research_and_development" in line_items
+            need_fcf = "free_cash_flow" in line_items
+            if need_rd or need_fcf:
+                query_parts = []
+                if need_rd:
+                    query_parts.append("研发费用")
+                if need_fcf:
+                    query_parts.append("企业自由现金流量FCFF")
+                query = f"{stock_name}最近一期{'、'.join(query_parts)}"
+                resp = _ifind_call("get_stock_financials", query)
+                answer = resp.get("data", {}).get("answer", "")
+                if answer:
+                    row_dict = _ifind_table_to_dict(answer)
+                    item = LineItem(
+                        ticker=ticker,
+                        report_period=end_dt,
+                        period="quarterly",
+                        currency="CNY",
+                    )
+                    if need_rd:
+                        item.research_and_development = _parse_amount(answer, "研发费用")
+                    if need_fcf:
+                        item.free_cash_flow = _parse_amount(answer, "企业自由现金流量FCFF")
+                    result = [item]
+        except Exception as e:
+            logger.debug(f"iFind fallback for search_line_items failed: {e}")
+
+    return result
 
 
 # ---------------------------------------------------------------------------
