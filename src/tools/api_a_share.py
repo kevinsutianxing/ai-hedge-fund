@@ -124,17 +124,8 @@ def get_financial_metrics(
         try:
             # 1) fina_indicator — financial indicators (ROE, margins, ratios, etc.)
             df_ind = ts_api.fina_indicator(
-                ts_code=ts_code, period="",
+                ts_code=ts_code,
                 start_date=start_dt, end_date=end_dt,
-                fields="ts_code,end_date,roe,roe_dt,roa,npta,eps,bps,pe,pb,ps,ps_ttm,"
-                       "total_revenue_ps,revenue_ps,revenue_ttm,revenue_yoy,op_yoy,ebt_yoy,netprofit_yoy,"
-                       "dt_yoy,grossprofit_margin,netprofit_margin,op_margin,expense_of_sales_on_revenue,"
-                       "admin_exp_of_gr,rd_exp,fin_exp_of_gr,invest_income_to_ebt,op_yoy_3,ebt_yoy_3,"
-                       "netprofit_yoy_3,op_yoy_5,ebt_yoy_5,netprofit_yoy_5,"
-                       "current_ratio,quick_ratio,cash_ratio,ar_turnover,ca_turnover,asset_turnover,"
-                       "inv_turnover,wc_turnover,receivable_turnover_days,"
-                       "op_cash_flow_to_op_profit,fcff,fcff_to_debt,debt_to_assets,debt_to_eq,"
-                       "ocfps,bps,diluted_eps,weightavg_roe",
             )
 
             # 2) daily_basic — market cap, PE, PB on end_date
@@ -146,27 +137,28 @@ def get_financial_metrics(
             # 3) income — for revenue / operating income
             df_income = ts_api.income(
                 ts_code=ts_code, start_date=start_dt, end_date=end_dt,
-                fields="ts_code,end_date,revenue,operate_profit,total_profit,"
-                       "net_profit,n_income_attr_p,deducted_profit",
             )
 
             # 4) balancesheet — for debt/equity ratios
             df_bs = ts_api.balancesheet(
                 ts_code=ts_code, start_date=start_dt, end_date=end_dt,
-                fields="ts_code,end_date,total_assets,total_liab,total_equity,"
-                       "total_cur_assets,total_cur_liab,total_non_cur_liab,"
-                       "cash_equivalents,shortterm_loan",
             )
 
             # 5) cashflow — for FCF
             df_cf = ts_api.cashflow(
                 ts_code=ts_code, start_date=start_dt, end_date=end_dt,
-                fields="ts_code,end_date,net_cash_flow_operate,net_cash_flow_inv,"
-                       "cash_pay_for_asset,net_cash_flow_fin",
             )
 
-            # Build lookup dicts by end_date
-            ind_by_date = {r["end_date"]: r for r in (df_ind.to_dict("records") if df_ind is not None and not df_ind.empty else [])}
+            # Build lookup dicts by end_date (dedup by end_date, keep first)
+            ind_records = []
+            if df_ind is not None and not df_ind.empty:
+                seen = set()
+                for r in df_ind.to_dict("records"):
+                    d = r.get("end_date")
+                    if d and d not in seen:
+                        seen.add(d)
+                        ind_records.append(r)
+            ind_by_date = {r["end_date"]: r for r in ind_records}
             daily_map = {}
             if df_daily is not None and not df_daily.empty:
                 row = df_daily.iloc[-1]
@@ -178,13 +170,25 @@ def get_financial_metrics(
                     "pb": row.get("pb"),
                     "ps": row.get("ps"),
                 }
-            income_by_date = {r["end_date"]: r for r in (df_income.to_dict("records") if df_income is not None and not df_income.empty else [])}
-            bs_by_date = {r["end_date"]: r for r in (df_bs.to_dict("records") if df_bs is not None and not df_bs.empty else [])}
-            cf_by_date = {r["end_date"]: r for r in (df_cf.to_dict("records") if df_cf is not None and not df_cf.empty else [])}
+            # Helper to dedup records by end_date
+            def _dedup(df):
+                if df is None or df.empty:
+                    return {}
+                seen, result = set(), []
+                for r in df.to_dict("records"):
+                    d = r.get("end_date")
+                    if d and d not in seen:
+                        seen.add(d)
+                        result.append(r)
+                return {r["end_date"]: r for r in result}
+
+            income_by_date = _dedup(df_income)
+            bs_by_date = _dedup(df_bs)
+            cf_by_date = _dedup(df_cf)
 
             # Use fina_indicator dates as base
             dates = sorted(ind_by_date.keys(), reverse=True)[:limit]
-            for d in dates:
+            for idx, d in enumerate(dates):
                 ind = ind_by_date[d]
                 inc = income_by_date.get(d, {})
                 bs = bs_by_date.get(d, {})
@@ -202,34 +206,50 @@ def get_financial_metrics(
                 # Financial ratios from fina_indicator
                 def _v(row, key):
                     val = row.get(key)
-                    if val is None or (isinstance(val, float) and pd.isna(val)):
+                    if val is None:
                         return None
-                    return float(val)
+                    if isinstance(val, float) and pd.isna(val):
+                        return None
+                    try:
+                        return float(val)
+                    except (ValueError, TypeError):
+                        return None
 
                 def _safe_div(a, b):
-                    if a and b and b != 0:
+                    if a is not None and b is not None and b != 0:
                         return float(a) / float(b)
                     return None
 
-                # Revenue growth
+            # Revenue growth (from fina_indicator revenue_yoy if available, else compute)
                 rev = _v(inc, "revenue")
-                # Get previous period revenue for growth calc
-                prev_rev = None
-                idx = dates.index(d) if d in dates else -1
-                if idx + 1 < len(dates):
-                    prev_d = dates[idx + 1]
-                    prev_inc = income_by_date.get(prev_d, {})
-                    prev_rev = _v(prev_inc, "revenue")
-                rev_growth = _safe_div(rev - prev_rev, prev_rev) if prev_rev and rev else None
+                net_profit = _v(inc, "net_profit")
+                equity = _v(bs, "total_equity")
+                total_assets = _v(bs, "total_assets")
+                
+                rev_yoy = _v(ind, "revenue_yoy")
+                if rev_yoy:
+                    rev_growth = rev_yoy / 100 if abs(rev_yoy) > 1 else rev_yoy
+                else:
+                    prev_rev = None
+                    idx2 = dates.index(d) if d in dates else -1
+                    if idx2 + 1 < len(dates):
+                        prev_d2 = dates[idx2 + 1]
+                        prev_inc = income_by_date.get(prev_d2, {})
+                        prev_rev = _v(prev_inc, "revenue")
+                    rev_growth = _safe_div(rev - prev_rev, prev_rev) if prev_rev and rev else None
 
                 # Earnings growth
-                net_profit = _v(inc, "net_profit")
-                prev_net = None
-                if idx + 1 < len(dates):
-                    prev_d = dates[idx + 1]
-                    prev_inc = income_by_date.get(prev_d, {})
-                    prev_net = _v(prev_inc, "net_profit")
-                earn_growth = _safe_div(net_profit - prev_net, prev_net) if prev_net and net_profit else None
+                net_yoy = _v(ind, "netprofit_yoy")
+                if net_yoy:
+                    earn_growth = net_yoy / 100 if abs(net_yoy) > 1 else net_yoy
+                else:
+                    prev_net = None
+                    idx2 = dates.index(d) if d in dates else -1
+                    if idx2 + 1 < len(dates):
+                        prev_d2 = dates[idx2 + 1]
+                        prev_inc = income_by_date.get(prev_d2, {})
+                        prev_net = _v(prev_inc, "net_profit")
+                    earn_growth = _safe_div(net_profit - prev_net, prev_net) if prev_net and net_profit else None
 
                 # FCF = operating cash flow - capex
                 ocf = _v(cf, "net_cash_flow_operate")
@@ -237,7 +257,6 @@ def get_financial_metrics(
                 fcf = (ocf - capex) if ocf and capex else ocf
 
                 # Book value growth
-                equity = _v(bs, "total_equity")
                 prev_equity = None
                 if idx + 1 < len(dates):
                     prev_d = dates[idx + 1]
@@ -317,7 +336,9 @@ def get_financial_metrics(
                 eps_growth = _safe_div(eps - prev_eps, prev_eps) if prev_eps and eps else None
 
                 # Working capital turnover
-                wc = _v(bs, "total_cur_assets") - _v(bs, "total_cur_liab")
+                tca = _v(bs, "total_cur_assets")
+                tcl = _v(bs, "total_cur_liab")
+                wc = (tca - tcl) if tca and tcl else None
                 wc_turnover = _safe_div(rev, wc) if rev and wc else None
 
                 report_date_str = d
@@ -335,24 +356,24 @@ def get_financial_metrics(
                     enterprise_value_to_revenue_ratio=ev_to_rev,
                     free_cash_flow_yield=fcf_yield,
                     peg_ratio=None,  # requires EPS growth and PE
-                    gross_margin=_v(ind, "grossprofit_margin"),
-                    operating_margin=_v(ind, "op_margin"),
-                    net_margin=_v(ind, "netprofit_margin"),
-                    return_on_equity=_v(ind, "roe") / 100 if _v(ind, "roe") else None,  # tushare returns %, need decimal
+                    gross_margin=_v(ind, "grossprofit_margin") / 100 if _v(ind, "grossprofit_margin") else None,
+                    operating_margin=_v(ind, "profit_to_gr") / 100 if _v(ind, "profit_to_gr") else None,
+                    net_margin=_v(ind, "netprofit_margin") / 100 if _v(ind, "netprofit_margin") else None,
+                    return_on_equity=_v(ind, "roe") / 100 if _v(ind, "roe") else None,
                     return_on_assets=roa,
                     return_on_invested_capital=roic,
-                    asset_turnover=_v(ind, "asset_turnover"),
-                    inventory_turnover=_v(ind, "inv_turnover"),
-                    receivables_turnover=_v(ind, "ar_turnover"),
-                    days_sales_outstanding=_v(ind, "receivable_turnover_days"),
+                    asset_turnover=_v(ind, "assets_turn"),
+                    inventory_turnover=_v(ind, "inv_turn"),
+                    receivables_turnover=_v(ind, "ar_turn"),
+                    days_sales_outstanding=_v(ind, "turn_days"),
                     operating_cycle=None,
-                    working_capital_turnover=wc_turnover,
+                    working_capital_turnover=_v(ind, "wc_turn"),
                     current_ratio=_v(ind, "current_ratio"),
                     quick_ratio=_v(ind, "quick_ratio"),
                     cash_ratio=_v(ind, "cash_ratio"),
                     operating_cash_flow_ratio=ocf_ratio,
-                    debt_to_equity=debt_to_eq,
-                    debt_to_assets=debt_to_assets,
+                    debt_to_equity=_v(ind, "debt_to_eq"),
+                    debt_to_assets=_v(ind, "debt_to_assets") / 100 if _v(ind, "debt_to_assets") else None,
                     interest_coverage=interest_coverage,
                     revenue_growth=rev_growth,
                     earnings_growth=earn_growth,
@@ -367,7 +388,7 @@ def get_financial_metrics(
                     free_cash_flow_per_share=_v(ind, "ocfps"),
                 ))
         except Exception as e:
-            logger.error(f"tushare financial_metrics failed for {ticker}: {e}")
+            logger.error(f"tushare financial_metrics failed for {ticker}: {e}", exc_info=True)
             # Fall through to akshare
     else:
         logger.info(f"tushare unavailable, using akshare for {ticker}")
@@ -506,40 +527,15 @@ def search_line_items(
     try:
         df_income = ts_api.income(
             ts_code=ts_code, start_date=start_dt, end_date=end_dt,
-            fields="ts_code,end_date,revenue,operate_cost,operate_cost_total,"
-                   "operate_profit,total_profit,net_profit,n_income_attr_p,deducted_profit,"
-                   "fin_exp,sell_exp,admin_exp,rd_exp,int_income,int_exp,"
-                   "premiums_earned,comm_income,compens_payout,insur_reserve,"
-                   "div_payable,reins_exp,other_bus_cost,other_comp_income,"
-                   "oper_tax_surchg,disposal_loss,assets_impair_loss,"
-                   "credit_impair_loss,goodwill_impair_loss",
         )
         df_bs = ts_api.balancesheet(
             ts_code=ts_code, start_date=start_dt, end_date=end_dt,
-            fields="ts_code,end_date,total_assets,total_liab,total_equity,"
-                   "total_cur_assets,total_cur_liab,cash_equivalents,"
-                   "notes_rcv,accounts_rcv,other_rcv,prepayments,inv,"
-                   "fixed_assets,cip,const_invest_oth,construction_mat,"
-                   " goodwill,long_eq_invest,other_non_cur_assets,"
-                   "shortterm_loan,notes_payable,accounts_pay,adv_from_cust,"
-                   "contract_liab,empl_ben_pay,tax_pay,other_pay,"
-                   "longterm_loan,bonds_pay,lease_liab,"
-                   "cap_reserve,surplus_reserve,treas_share,retained_earnings,"
-                   "minority_interest,other_comp_income",
         )
         df_cf = ts_api.cashflow(
             ts_code=ts_code, start_date=start_dt, end_date=end_dt,
-            fields="ts_code,end_date,net_cash_flow_operate,net_cash_flow_inv,"
-                   "cash_pay_for_asset,cash_rec_inv,net_cash_flow_fin,"
-                   "cash_pay_for_debt,cash_rec_from_debt,"
-                   "cash_pay_div_int,absorb_inv_cash,sub_borrow_cash,"
-                   "fix_intan_other_asset_acqu",
         )
-
-        # Also get fina_indicator for computed fields
         df_ind = ts_api.fina_indicator(
             ts_code=ts_code, start_date=start_dt, end_date=end_dt,
-            fields="ts_code,end_date,eps,bps,roe,fcff",
         )
 
         # daily_basic for market cap / price
@@ -548,10 +544,21 @@ def search_line_items(
             fields="ts_code,close,total_mv",
         )
 
-        inc_by_date = {r["end_date"]: r for r in (df_income.to_dict("records") if df_income is not None and not df_income.empty else [])}
-        bs_by_date = {r["end_date"]: r for r in (df_bs.to_dict("records") if df_bs is not None and not df_bs.empty else [])}
-        cf_by_date = {r["end_date"]: r for r in (df_cf.to_dict("records") if df_cf is not None and not df_cf.empty else [])}
-        ind_by_date = {r["end_date"]: r for r in (df_ind.to_dict("records") if df_ind is not None and not df_ind.empty else [])}
+        def _dedup(df):
+            if df is None or df.empty:
+                return {}
+            seen, result = set(), []
+            for r in df.to_dict("records"):
+                d = r.get("end_date")
+                if d and d not in seen:
+                    seen.add(d)
+                    result.append(r)
+            return {r["end_date"]: r for r in result}
+
+        inc_by_date = _dedup(df_income)
+        bs_by_date = _dedup(df_bs)
+        cf_by_date = _dedup(df_cf)
+        ind_by_date = _dedup(df_ind)
 
         close_price = None
         total_mv = None
